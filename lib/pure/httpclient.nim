@@ -1005,6 +1005,41 @@ proc requestAux(client: HttpClient | AsyncHttpClient, url, httpMethod: string,
                 client.getBody
   result = await parseResponse(client, getBody)
 
+proc requestStreamingAux(client: AsyncHttpClient, url, httpMethod: string,
+                         body: FutureStream[string] = nil, headers: HttpHeaders = nil):
+                         Future[AsyncResponse] {.async.} =
+  # Helper that actually makes the streaming request. Does not handle redirects.
+  # It is the responsibility of the User to set proper headers, like Content-Length
+  # among other things. Consequently, the User must stream the proper body length,
+  # matching that which was set in the headers, and at the end, body must be
+  # `complete()`d.
+
+  let requestUrl = parseUri(url)
+  if requestUrl.scheme == "":
+    raise newException(ValueError, "No uri scheme supplied.")
+
+  await newConnection(client, requestUrl)
+
+  let newHeaders = client.headers.override(headers)
+  if not newHeaders.hasKey("user-agent") and client.userAgent.len > 0:
+    newHeaders["User-Agent"] = client.userAgent
+
+  let headerString = generateHeaders(requestUrl, httpMethod, newHeaders,
+                                     client.proxy)
+  await client.socket.send(headerString)
+
+  if body != nil:
+    while true:
+      let (hasData, sdata) = await body.read()
+      if hasData:
+        await client.socket.send(sdata)
+      else:
+        break
+  
+  let getBody = httpMethod.toLowerAscii() notin ["head", "connect"] and
+                client.getBody
+  result = await parseResponse(client, getBody)
+
 proc request*(client: HttpClient | AsyncHttpClient, url: string,
               httpMethod: string, body = "", headers: HttpHeaders = nil,
               multipart: MultipartData = nil): Future[Response | AsyncResponse]
@@ -1043,6 +1078,22 @@ proc request*(client: HttpClient | AsyncHttpClient, url: string,
   ## When a request is made to a different hostname, the current connection will
   ## be closed.
   result = await request(client, url, $httpMethod, body, headers, multipart)
+
+proc request*(client: AsyncHttpClient, url: string,
+              httpMethod: string, body: FutureStream[string],
+              headers: HttpHeaders = nil): Future[AsyncResponse] {.async.} =
+  ## Executes a streaming request to the ``url`` using the ``httpMethod``
+
+  result = await client.requestStreamingAux(url, httpMethod, body, headers)
+
+  var lastURL = url
+  for i in 1..client.maxRedirects:
+    if result.status.redirection():
+      let redirectTo = getNewLocation(lastURL, result.headers)
+      # Guarantee method for HTTP 307: see https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/307
+      var meth = if result.status == "307": httpMethod else: "GET"
+      result = await client.requestStreamingAux(redirectTo, meth, body, headers)
+      lastURL = redirectTo
 
 proc responseContent(resp: Response | AsyncResponse): Future[string] {.multisync.} =
   ## Returns the content of a response as a string.
